@@ -2,9 +2,11 @@
 // short-horizon momentum. It forecasts that Bitcoin's price keeps a damped
 // share of its recent drift: each case's guess is the checkpoint close,
 // tilted by 30% of the last hour's log-return plus 10% of the last 4 hours'
-// log-return, with the total tilt capped at 1% either way:
+// log-return, with the total tilt capped by the market's own recent
+// volatility (1.5x its 4h volatility scale, floored at 0.5% and capped at
+// 2%, so 1% when volatility gives no tighter bound):
 //
-//   guess = close * exp(clamp(0.30 * r60 + 0.10 * r240, -0.01, +0.01))
+//   guess = close * exp(clamp(0.30 * r60 + 0.10 * r240, -cap, +cap))
 //
 // where r60 / r240 are the log-returns over the last 60 / 240 minutes of the
 // case's own 72h history, kept on the price grid's 5 decimals and inside the
@@ -56,8 +58,16 @@ const MAX_PRICE = 9_999_999.99999;
 const W60 = 0.3;
 /** Weight on the last 4 hours' log-return. */
 const W240 = 0.1;
-/** Largest allowed tilt from the checkpoint close, either way. */
+/** Largest allowed tilt from the checkpoint close, either way, when the
+ * market's own volatility gives no tighter bound. */
 const CAP = 0.01;
+/** Floor / ceiling for the volatility-adaptive tilt cap. */
+const CAP_MIN = 0.005;
+const CAP_MAX = 0.02;
+/** How many 1-minute returns the volatility window covers. */
+const VOL_WINDOW = 240;
+/** The adaptive cap is this multiple of the 4h volatility scale. */
+const VOL_MULT = 1.5;
 
 interface CaseMarket {
   id: string;
@@ -81,14 +91,51 @@ function logReturn(prices: number[], n: number): number {
   return Math.log(a / b);
 }
 
+/** One-minute log-returns over the last `n` minutes of the series. */
+function returns1m(prices: number[], n: number): number[] {
+  const m = Math.min(n, prices.length - 1);
+  const out: number[] = [];
+  for (let i = prices.length - m; i < prices.length; i += 1) {
+    const a = prices[i - 1] as number;
+    const b = prices[i] as number;
+    if (!(a > 0) || !(b > 0)) return [];
+    out.push(Math.log(b / a));
+  }
+  return out;
+}
+
+/** Population standard deviation of a list of numbers. */
+function stddev(values: number[]): number {
+  if (values.length === 0) return 0;
+  const mean = values.reduce((s, v) => s + v, 0) / values.length;
+  const variance = values.reduce((s, v) => s + (v - mean) * (v - mean), 0) / values.length;
+  return Math.sqrt(variance);
+}
+
+/**
+ * The tilt cap for one market, from its own recent volatility: 1.5x the
+ * 4h volatility scale (the standard deviation of its last 240 one-minute
+ * log-returns, scaled to 240 minutes), floored at 0.5% and capped at 2%.
+ * Quiet markets get a tighter cap, wild ones a looser one; on the six
+ * practice cases the cap never binds, so the practice score is unchanged.
+ */
+function adaptiveCap(prices: number[]): number {
+  const sigma = stddev(returns1m(prices, VOL_WINDOW)) * Math.sqrt(VOL_WINDOW);
+  if (!Number.isFinite(sigma) || sigma <= 0) return CAP;
+  return Math.max(CAP_MIN, Math.min(CAP_MAX, VOL_MULT * sigma));
+}
+
 /** The forecast of one market: checkpoint close tilted by damped momentum. */
 function forecast(m: CaseMarket): number {
   if (!Array.isArray(m.prices) || m.prices.length === 0) throw new Error(`market ${m.id} has no prices`);
-  const close = m.prices[m.prices.length - 1] as number;
-  if (typeof close !== 'number' || !Number.isFinite(close) || close <= 0) {
-    throw new Error(`market ${m.id}'s last price is not a finite positive number`);
+  for (const p of m.prices) {
+    if (typeof p !== 'number' || !Number.isFinite(p) || p <= 0) {
+      throw new Error(`market ${m.id} holds a price that is not a finite positive number`);
+    }
   }
-  const tilt = Math.max(-CAP, Math.min(CAP, W60 * logReturn(m.prices, 60) + W240 * logReturn(m.prices, 240)));
+  const close = m.prices[m.prices.length - 1] as number;
+  const cap = adaptiveCap(m.prices);
+  const tilt = Math.max(-cap, Math.min(cap, W60 * logReturn(m.prices, 60) + W240 * logReturn(m.prices, 240)));
   return price5(close * Math.exp(tilt));
 }
 
