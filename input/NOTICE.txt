@@ -1,0 +1,19 @@
+Where these prices come from
+
+Each case file <id>.in holds, for BTC/USDC, the close of every minute of the 72 hours ending at the case's
+checkpoint `at`, one number a minute in `markets[0].prices`, in US dollars per whole BTC (USDC per BTC).
+
+The price is the mid price of Solana's CBBTC/USDC Orca Whirlpool HxA6SKW5qA4o12fjVgTpXdq2YnZ5Zv1s7SB4FFomsyLM, from
+the pool's own sqrt price, read every 2 seconds by make.fun's recorder (collector/bars in the make.fun repository)
+into the recording btc-usdc-1m on the cluster's data claim. The recording keeps the price as an integer at scale
+10^-5 USDC; each case writes it in dollars.
+
+A minute's price is the close of the recording's 1-minute bar closing at that minute: the median of the bar's
+samples in its last 10 seconds (collector/bars/freeze.ts: a 1m bar's o and c are the medians of its first and last
+10 seconds of samples). A minute with no sample of its own takes the latest close before it, carried forward;
+nothing is ever filled backwards. The answer is the same close at `at` + 240 minutes.
+
+The practice is cut from the recording's past window 2026-11-07T06:00:00Z to 2026-11-11T06:00:00Z: six checkpoints,
+p00 to p05, 4 hours apart from 2026-11-10T06:00:00Z, each answered 240 minutes later, through
+2026-11-11T06:00:00Z. The final's twelve checkpoints are recorded after the deadline by the same recorder. The
+practice is graded on prices already recorded and pays nothing: a practice score is no guide to the final.
