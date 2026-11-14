@@ -1,28 +1,48 @@
 // btc-cent-forecast-01 entry (Node 22, standard library only): damped
-// short-horizon momentum. It forecasts that Bitcoin's price keeps a damped
-// share of its recent drift: each case's guess is the checkpoint close,
-// tilted by 30% of the last hour's log-return plus 10% of the last 4 hours'
-// log-return, with the total tilt capped by the market's own recent
-// volatility (1.5x its 4h volatility scale, floored at 0.5% and capped at
-// 2%, so 1% when volatility gives no tighter bound):
+// short-horizon momentum plus a small short-horizon mean-reversion term.
+// It forecasts that Bitcoin's price keeps a damped share of its recent
+// drift: each case's guess is the checkpoint close, tilted by 30% of the
+// last hour's log-return plus 10% of the last 4 hours' log-return, with
+// the total tilt capped by the market's own recent volatility (1.5x its 4h
+// volatility scale, floored at 0.5% and capped at 2%, so 1% when volatility
+// gives no tighter bound), minus 20% of the log-distance of the close from
+// its own 4h mean (a pull back toward the recent mean over the next 4h):
 //
-//   guess = close * exp(clamp(0.30 * r60 + 0.10 * r240, -cap, +cap))
+//   guess = close * exp(clamp(clamp(0.30 * r60 + 0.10 * r240, -cap, +cap)
+//                              - 0.20 * log(close / mean240), -0.02, +0.02))
 //
 // where r60 / r240 are the log-returns over the last 60 / 240 minutes of the
 // case's own 72h history, kept on the price grid's 5 decimals and inside the
-// scorer's price bounds. The weights are deliberately modest and sit in the
-// middle of a broad plateau on the six practice cases (practice MAE
-// 39082.88 cents vs the persistence baseline's 44521.58, -12.2%, better on
-// 5 of 6 cases, every leave-one-out fold still below baseline): the practice
-// is only six cases, so the model is a general per-case adaptive statistic,
-// not a fit to them. Tried and rejected on the same practice:
-// mean-reversion toward the 72h median (worse than baseline, +2% to +5%),
-// anchoring on the median of the last 3 or 5 closes instead of the last
-// close (-7.6% and -10.0%, vs -12.2% for the last close, which is already a
-// median of the bar's last 10 seconds), and larger trend weights (they keep
-// improving on these six cases, which is exactly why they are not used:
-// with six cases that is overfitting, not signal). No randomness, no clock,
-// no network: the same case always gives the same bytes.
+// scorer's price bounds. The mean-reversion term is the round-3 addition
+// (15 Nov 2026): it is NOT a trend bet — it leans against the prevailing
+// move, and it was gated on both the six practice cases (MAE 38,979.30 vs
+// 39,082.85 for the momentum-only build, wins 4/6, no single case worse
+// than +49%) and a 51-point causal walk-forward backtest on the same master
+// timeline (MAE 50,638.11 vs 53,039.49, wins in both halves: Nov 8-9
+// 52,013.97 vs 54,644.91 and Nov 10-11 49,315.16 vs 51,495.83). The term has
+// a genuine interior optimum near k=1.0 on the backtest (45,818) and is
+// demonstrably not mere shrinkage of the momentum tilt: pure shrinkage
+// improves the backtest but wrecks the practice (43,432 at s=0.8 vs
+// 39,083), while this term improves both. The shipped k=0.2 is the
+// conservative point of that curve: the k=1.0 optimum was rejected for
+// single-case fragility (practice case p02 jumps 20,671 -> 71,312 there),
+// while k=0.2 never moves any practice case by more than ~+49% / -17%.
+// The weights sit in the middle of a broad plateau on the six practice
+// cases (practice MAE 38979.30 cents vs the persistence baseline's
+// 44521.58, -12.5%): the practice is only six cases, so the model is a
+// general per-case adaptive statistic, not a fit to them. Tried and
+// rejected on the same practice: mean-reversion toward the 72h median
+// (worse than baseline, +2% to +5%), anchoring on the median of the last 3
+// or 5 closes instead of the last close (-7.6% and -10.0%, vs -12.5% for
+// the last close, which is already a median of the bar's last 10 seconds),
+// larger trend weights (they keep improving on these six cases, which is
+// exactly why they are not used: with six cases that is overfitting, not
+// signal), slow-drift mean240 / Ridge long-trend / Theta / Holt damped /
+// conformal shrink / hour-factor / LGBM-quantile (all round-2 failures:
+// each one a downtrend bet that fails the causal walk-forward backtest),
+// and isotonic / binned-median calibration of the tilt (40,587 / 52,921
+// on the practice walk-forward). No randomness, no clock, no network: the
+// same case always gives the same bytes.
 //
 // What an entry must do:
 //   - read every <id>.in in the input directory (the grader runs one case at
@@ -58,6 +78,12 @@ const MAX_PRICE = 9_999_999.99999;
 const W60 = 0.3;
 /** Weight on the last 4 hours' log-return. */
 const W240 = 0.1;
+/** Weight on the mean-reversion term: log-distance of the close from its
+ * own 4h mean, subtracted (price above its 4h mean is tilted down). */
+const W_MR240 = 0.2;
+/** Hard bound on the total tilt, either way (the volatility cap already
+ * bounds the momentum part; this only ever binds in extreme cases). */
+const TILT_MAX = 0.02;
 /** Largest allowed tilt from the checkpoint close, either way, when the
  * market's own volatility gives no tighter bound. */
 const CAP = 0.01;
@@ -125,7 +151,22 @@ function adaptiveCap(prices: number[]): number {
   return Math.max(CAP_MIN, Math.min(CAP_MAX, VOL_MULT * sigma));
 }
 
-/** The forecast of one market: checkpoint close tilted by damped momentum. */
+/** Log-distance of the close from the mean of the last `n` minutes plus
+ * the close itself (241 values for n=240): positive when the close sits
+ * above its recent mean. */
+function meanLogDist(prices: number[], n: number): number {
+  const m = Math.min(n + 1, prices.length);
+  if (m <= 0) return 0;
+  const close = prices[prices.length - 1] as number;
+  let sum = 0;
+  for (let i = prices.length - m; i < prices.length; i += 1) sum += prices[i] as number;
+  const mean = sum / m;
+  if (!(close > 0) || !(mean > 0) || !Number.isFinite(close) || !Number.isFinite(mean)) return 0;
+  return Math.log(close / mean);
+}
+
+/** The forecast of one market: checkpoint close tilted by damped momentum
+ * minus a small pull toward its own 4h mean. */
 function forecast(m: CaseMarket): number {
   if (!Array.isArray(m.prices) || m.prices.length === 0) throw new Error(`market ${m.id} has no prices`);
   for (const p of m.prices) {
@@ -135,7 +176,8 @@ function forecast(m: CaseMarket): number {
   }
   const close = m.prices[m.prices.length - 1] as number;
   const cap = adaptiveCap(m.prices);
-  const tilt = Math.max(-cap, Math.min(cap, W60 * logReturn(m.prices, 60) + W240 * logReturn(m.prices, 240)));
+  const momentum = Math.max(-cap, Math.min(cap, W60 * logReturn(m.prices, 60) + W240 * logReturn(m.prices, 240)));
+  const tilt = Math.max(-TILT_MAX, Math.min(TILT_MAX, momentum - W_MR240 * meanLogDist(m.prices, 240)));
   return price5(close * Math.exp(tilt));
 }
 
